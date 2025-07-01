@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Full Stack Infra - Cognito, S3, Lambda, AppSync (Presigned URL)
+
+Resources:
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: RafayUserPool
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: false
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: RafayClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+
+  # S3 Bucket
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: rafay-image-storage
+      AccessControl: Private
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub lambda-presign-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${ImageBucket.Arn}/images/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda for generating presigned URL
+  PresignLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: generatePresignedUrlFunction
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          BUCKET: !Ref ImageBucket
+      Code:
+        ZipFile: |
+          const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+          const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+          exports.handler = async (event) => {
+            const { fileName, fileType, userId = "test-user" } = event;
+
+            if (!fileName || !fileType) {
+              return {
+                statusCode: 400,
+                body: JSON.stringify({ error: "Missing fileName or fileType" }),
+              };
+            }
+
+            const s3 = new S3Client({ region: "us-east-1" });
+            const key = `images/${userId}/${fileName}`;
+
+            const command = new PutObjectCommand({
+              Bucket: process.env.BUCKET,
+              Key: key,
+              ContentType: fileType,
+            });
+
+            try {
+              const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 300 });
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ uploadUrl, key }),
+              };
+            } catch (err) {
+              console.error(err);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ error: "Presign failed" }),
+              };
+            }
+          };
+
+  # AppSync API
+  GraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: PresignImageApi
+      AuthenticationType: AMAZON_COGNITO_USER_POOLS
+      UserPoolConfig:
+        AwsRegion: us-east-1
+        UserPoolId: !Ref UserPool
+        DefaultAction: ALLOW
+
+  # Schema Definition
+  GraphQLSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Definition: |
+        type Mutation {
+          getImageUploadUrl(fileName: String!, fileType: String!): S3UploadPayload!
+        }
+
+        type S3UploadPayload {
+          uploadUrl: String!
+          key: String!
+        }
+        type Query {
+          _empty: String
+        }
+
+        schema {
+          mutation: Mutation
+          query: Query
+        }
+
+  # IAM Role for AppSync to call Lambda
+  AppSyncLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AppSyncLambdaInvokeRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: appsync.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePresignLambda
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt PresignLambda.Arn
+
+  # AppSync Data Source (Lambda)
+  LambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      Name: PresignLambdaDataSource
+      Type: AWS_LAMBDA
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt PresignLambda.Arn
+      ServiceRoleArn: !GetAtt AppSyncLambdaInvokeRole.Arn
+
+  # Resolver
+  GetUploadUrlResolver:
+    Type: AWS::AppSync::Resolver
+    DependsOn: LambdaDataSource
+    Properties:
+      ApiId: !GetAtt GraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: getImageUploadUrl
+      DataSourceName: PresignLambdaDataSource
+      Kind: UNIT
+      RequestMappingTemplate: |
+        {
+          "version": "2018-05-29",
+          "operation": "Invoke",
+          "payload": {
+            "fileName": $util.toJson($ctx.args.fileName),
+            "fileType": $util.toJson($ctx.args.fileType),
+            "userId": $util.toJson($ctx.identity.sub)
+          }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+          $util.error($ctx.error.message, $ctx.error.type)
+        #end
+        $util.toJson($util.parseJson($ctx.result.body))
+
+Outputs:
+  ApiURL:
+    Value: !GetAtt GraphQLApi.GraphQLUrl
+  BucketName:
+    Value: !Ref ImageBucket
+  LambdaName:
+    Value: !Ref PresignLambda
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
